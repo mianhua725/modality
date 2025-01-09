@@ -1,0 +1,99 @@
+import os
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from collections import defaultdict
+import random
+from concurrent.futures import ThreadPoolExecutor
+
+# Get patient IDs from the data directory
+def get_patient_ids(data_dir):
+    embeddings_dir = os.path.join(data_dir, 'embeddings')
+    return [f.split('.')[0] for f in os.listdir(embeddings_dir) if f.endswith('.npz')]
+
+# Filter and split patient IDs
+def filter_and_split_patient_ids(patient_ids, contours_file, train_ratio=0.64, valid_ratio=0.14, test_ratio=0.2):
+    contours_df = pd.read_csv(contours_file)
+    contours_df = contours_df[(contours_df['Slices with Contours'] >= 1) & 
+                              (contours_df['Slices with Contours'] <= 64)]
+    contours_df = contours_df.sort_values(by='Slices with Contours', ascending=False)
+
+    filtered_patient_ids = [pid for pid in patient_ids if pid in contours_df['Patient'].values]
+    if len(filtered_patient_ids) == 0:
+        raise ValueError("No patient IDs available after filtering. Check contours file and patient IDs.")
+
+    filtered_patient_ids = sorted(
+        filtered_patient_ids,
+        key=lambda x: contours_df[contours_df['Patient'] == x]['Slices with Contours'].values[0]
+    )
+
+    def balanced_split(ids, contours_df, ratios):
+        group_data = defaultdict(list)
+        for pid in ids:
+            contours_count = contours_df[contours_df['Patient'] == pid]['Slices with Contours'].values[0]
+            group_data[contours_count].append(pid)
+        
+        sorted_groups = sorted(group_data.items(), key=lambda x: x[0])
+        train_ids, valid_ids, test_ids = [], [], []
+        for _, group in sorted_groups:
+            random.shuffle(group)
+            test_size = int(np.round(len(group) * ratios[2]))
+            test_ids.extend(group[:test_size])
+            train_size = int(len(group) * ratios[0])
+            train_ids.extend(group[test_size:test_size + train_size])
+            valid_ids.extend(group[test_size + train_size:])
+        return train_ids, valid_ids, test_ids
+
+    return balanced_split(filtered_patient_ids, contours_df, [train_ratio, valid_ratio, test_ratio])
+
+# Function to process and save a single patient
+def process_and_save_patient(patient_id, data_dir, output_dir, split_name):
+    images_dir = os.path.join(data_dir, 'images')
+    masks_dir = os.path.join(data_dir, 'masks')
+    embeddings_dir = os.path.join(data_dir, 'embeddings')
+    
+    split_images_dir = os.path.join(output_dir, split_name, 'images')
+    split_masks_dir = os.path.join(output_dir, split_name, 'masks')
+    split_embeddings_dir = os.path.join(output_dir, split_name, 'embeddings')
+    
+    os.makedirs(split_images_dir, exist_ok=True)
+    os.makedirs(split_masks_dir, exist_ok=True)
+    os.makedirs(split_embeddings_dir, exist_ok=True)
+
+    try:
+        # Attempt to load and save images
+        image_path = os.path.join(images_dir, f"{patient_id}.npz")
+        mask_path = os.path.join(masks_dir, f"{patient_id}.npz")
+        embedding_path = os.path.join(embeddings_dir, f"{patient_id}.npz")
+
+        if os.path.exists(image_path):
+            np.savez_compressed(os.path.join(split_images_dir, f"{patient_id}.npz"), **np.load(image_path))
+        if os.path.exists(mask_path):
+            np.savez_compressed(os.path.join(split_masks_dir, f"{patient_id}.npz"), **np.load(mask_path))
+        if os.path.exists(embedding_path):
+            np.savez_compressed(os.path.join(split_embeddings_dir, f"{patient_id}.npz"), **np.load(embedding_path))
+    except Exception as e:
+        print(f"Error processing patient {patient_id}: {e}")
+
+# Save split data using multithreading
+def save_split(patient_ids, split_name, data_dir, output_dir, num_threads=8):
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        tasks = [executor.submit(process_and_save_patient, pid, data_dir, output_dir, split_name) for pid in patient_ids]
+        for _ in tqdm(tasks, desc=f"Saving {split_name} data"):
+            _.result()
+
+# Main execution
+data_dir = "/scratch/mingma/HN/Radcure/Data/pre_split/V2"
+contours_file = "/scratch/mingma/HN/Radcure/Data/pre_split/contour_summary.csv"
+output_dir = "/scratch/mingma/HN/Radcure/Data/new"
+
+# Step 1: Get patient IDs
+patient_ids = get_patient_ids(data_dir)
+
+# Step 2: Filter and split patient IDs
+train_ids, valid_ids, test_ids = filter_and_split_patient_ids(patient_ids, contours_file)
+
+# Step 3: Save splits
+save_split(test_ids, 'test', data_dir, output_dir, num_threads=96)
+save_split(train_ids, 'train', data_dir, output_dir, num_threads=96)
+save_split(valid_ids, 'valid', data_dir, output_dir, num_threads=96)
