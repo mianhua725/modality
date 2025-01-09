@@ -1,0 +1,17 @@
+import numpy as np
+import os
+
+data = np.load('.../patients_cancer_embeddings_with_ids.npz')
+
+embeddings = data['embeddings']
+patient_ids = data['patient_id']
+
+output_dir = ".../embeddings"
+os.makedirs(output_dir, exist_ok=True)
+
+# Save each embedding with the corresponding patient_id as the filename
+for embedding, patient_id in zip(embeddings, patient_ids):
+    patient_file_path = os.path.join(output_dir, f"{patient_id}.npz")
+    np.savez(patient_file_path, embeddings=embedding)
+
+print(f"All embeddings have been saved in the '{output_dir}' directory.")
