@@ -17,7 +17,7 @@ from monai.transforms import Compose, CropForegroundd, CenterSpatialCropd, RandA
 import logging
 import random
 
-# log_dir = "/scratch/mingma/HN/Radcure/Code/model/swin_unetr/v3/logs"
+# log_dir = ""
 # os.makedirs(log_dir, exist_ok=True)  
 # log_path = os.path.join(log_dir, "training.log")
 
@@ -94,7 +94,7 @@ def main():
                 self.transforms = Compose([
                 CropForegroundd(keys=["image", "label"], source_key="label", margin=(crop_size[0]//2, crop_size[1]//2, crop_size[2]//2)),  # 根据前景裁剪
                 CenterSpatialCropd(keys=["image", "label"], roi_size=crop_size),  # 中心裁剪
-                RandAffined(keys=['image', 'label'], rotate_range=(0.2618, 0.2618, 0.2618), translate_range=(10, 10, 10), scale_range=None, mode=('bilinear', 'nearest'), prob=0.5)
+                RandAffined(keys=['image', 'label'], rotate_range=(0.2618, 0.2618, 0.2618), translate_range=(10, 10, 10), scale_range=None, mode=('bilinear', 'nearest'), prob=0.3)
             ])
             else:
                 self.transforms = Compose([
@@ -132,7 +132,7 @@ def main():
     
 
     # Dataset and DataLoader Setup
-    data_dir = "/scratch/mingma/HN/Radcure/Data/subset1000"
+    data_dir = ""
     crop_size=(64, 128, 128)
     transform = Transform(crop_size=crop_size)
     train_dataset = VDataset(os.path.join(data_dir, 'train'), transform=Transform(crop_size, 'train'))
@@ -175,7 +175,7 @@ def main():
     model = SwinUNETR(img_size=crop_size, in_channels=1, out_channels=1, feature_size=48)
     model = model.to(device)
     
-    pretrained_weights_path = '/scratch/mingma/HN/Radcure/Code/model/pretrained_weights/fold1_f48_ep300_4gpu_dice0_9059/model.pt'
+    pretrained_weights_path = ''
     pretrained_weights = torch.load(pretrained_weights_path, map_location=device)
     state_dict = pretrained_weights['state_dict']  # 提取预训练模型的 state_dict
     swin_weights = {k: v for k, v in state_dict.items() if ('swinViT' in k) and ('patch_embed.proj.weight' not in k)}  # 筛选 Swin Transformer 层的权重
@@ -189,7 +189,7 @@ def main():
     
     
     # Training Setup
-    learning_rate = 4e-4
+    learning_rate = 1e-3
     weight_decay = 1e-3
     num_epochs = 200
     optimizer = Adam(list(clip_model.parameters()) + list(model.parameters()), lr=learning_rate, weight_decay=weight_decay)
@@ -211,7 +211,7 @@ def main():
     hd95_metric = HausdorffDistanceMetric(include_background=True, percentile=95, reduction="mean", get_not_nans=True)
 
     # CSV File Setup
-    out_base_dir = '/scratch/mingma/HN/Radcure/Code/model/swin_unetr/v9_aug'
+    out_base_dir = ''
     csv_path = os.path.join(out_base_dir, 'training_validation_metrics.csv')
     if not os.path.exists(csv_path):
         with open(csv_path, mode='w', newline='') as file:
