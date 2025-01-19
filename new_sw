@@ -1,0 +1,430 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.parallel import DataParallel
+from torch.optim import Adam
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import csv
+from swin_unetr import SwinUNETR
+# from monai.networks.nets import SwinUNETR
+from monai.losses import DiceFocalLoss, TverskyLoss
+from monai.metrics import DiceMetric, MeanIoU, HausdorffDistanceMetric
+from monai.transforms import Compose, CropForegroundd, CenterSpatialCropd, RandAffined
+import logging
+import random
+
+# log_dir = "/scratch/mingma/HN/Radcure/Code/model/swin_unetr/v3/logs"
+# os.makedirs(log_dir, exist_ok=True)  
+# log_path = os.path.join(log_dir, "training.log")
+
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format='%(asctime)s - %(levelname)s - %(message)s',
+#     handlers=[
+#         logging.FileHandler(log_path),
+#         logging.StreamHandler()
+#     ]
+# )
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# Main Function
+def main():
+    set_seed(42)
+    # GPU Setup
+    os.environ["CUDA_VISIBLE_DEVICES"] = "5, 7"
+    torch.cuda.set_device(0)
+
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+
+    # Dataset Definition
+    class VDataset(Dataset):
+        def __init__(self, data_dir, transform=None):
+            self.data_dir = data_dir
+            self.images_dir = os.path.join(data_dir, "images")
+            self.masks_dir = os.path.join(data_dir, "masks")
+            # self.embeddings_dir = os.path.join(data_dir, "embeddings")
+            self.patient_ids = [f.split('.')[0] for f in os.listdir(self.images_dir)]
+            self.transform = transform
+
+        def __len__(self):
+            return len(self.patient_ids)
+
+        def __getitem__(self, idx):
+            patient_id = self.patient_ids[idx]
+            # File paths
+            image_path = os.path.join(self.images_dir, f"{patient_id}.npz")
+            mask_path = os.path.join(self.masks_dir, f"{patient_id}.npz")
+            # embedding_path = os.path.join(self.embeddings_dir, f"{patient_id}.npz")           
+            # Load data
+            ct_images = np.load(image_path)['ct_images']  
+            masks = np.load(mask_path)['masks']  
+            # embeddings = np.load(embedding_path)['embeddings']              
+            # Convert to tensors
+            ct_images = torch.tensor(ct_images, dtype=torch.float32).unsqueeze(0)  # Add channel dimension # Shape: [1, D, H, W]
+            masks = torch.tensor(masks, dtype=torch.long).unsqueeze(0) # Shape: [1, D, H, W]
+            # embeddings = torch.tensor(embeddings, dtype=torch.float32)            
+            # Create sample
+            # sample = {"image": ct_images, "label": masks, "embedding": embeddings}
+            sample = {"image": ct_images, "label": masks}
+            if self.transform:
+                image = self.transform(sample)
+            return ct_images, image, masks
+
+    # Transform Definition
+    class Transform:
+        def __init__(self, crop_size, split=None):
+            self.crop_size = crop_size
+            if split == 'train':
+                self.transforms = Compose([
+                CropForegroundd(keys=["image", "label"], source_key="label", margin=(crop_size[0]//2, crop_size[1]//2, crop_size[2]//2)),  # 根据前景裁剪
+                CenterSpatialCropd(keys=["image", "label"], roi_size=crop_size),  # 中心裁剪
+                RandAffined(keys=['image', 'label'], rotate_range=(0.2618, 0.2618, 0.2618), translate_range=(10, 10, 10), scale_range=None, mode=('bilinear', 'nearest'), prob=0.5)
+            ])
+            else:
+                self.transforms = Compose([
+                CropForegroundd(keys=["image", "label"], source_key="label", margin=(crop_size[0]//2, crop_size[1]//2, crop_size[2]//2)),  # 根据前景裁剪
+                CenterSpatialCropd(keys=["image", "label"], roi_size=crop_size)  # 中心裁剪
+            ])
+            
+
+        def __call__(self, sample):
+            # image, label = sample['image'], sample['label']
+            # Clip the CT images to the range based on intensity thresholds
+            # if image.min() < -2000:
+            #     image = image.clip(-1000, 600)   
+            # else:
+            #     image = image.clip(0, 1600)
+            # depth, height, width = image.shape[1:]
+            # crop_d, crop_h, crop_w = self.crop_size
+            # d1 = (depth - crop_d) // 2
+            # h1 = (height - crop_h) // 2
+            # w1 = (width - crop_w) // 2
+            # image = image[:, d1:d1+crop_d, h1:h1+crop_h, w1:w1+crop_w]
+            # label = label[d1:d1+crop_d, h1:h1+crop_h, w1:w1+crop_w]
+            # image = (image - image.min()) / (image.max() - image.min()) # normalize 
+            
+            # Wrap in dictionary for MONAI compatibility
+            # data = {"image": image, "label": label}
+            # Apply MONAI transforms
+            transformed = self.transforms(sample)
+            image = transformed["image"]
+            # label = transformed["label"]
+            # Normalize the image
+            image = (image - image.min()) / (image.max() - image.min())
+            
+            return image
+    
+
+    # Dataset and DataLoader Setup
+    data_dir = "/scratch/mingma/HN/Radcure/Data/subset1000"
+    crop_size=(64, 128, 128)
+    transform = Transform(crop_size=crop_size)
+    train_dataset = VDataset(os.path.join(data_dir, 'train'), transform=Transform(crop_size, 'train'))
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=24)
+    val_dataset = VDataset(os.path.join(data_dir, 'valid'), transform=transform)
+    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=24)
+    test_dataset = VDataset(os.path.join(data_dir, 'test'), transform=transform)
+    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=True, num_workers=24)
+
+    # Model Initialization
+    class ClipNetwork(nn.Module):
+        def __init__(self):
+            super(ClipNetwork, self).__init__()
+            self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
+            self.pool = nn.MaxPool2d(2, 2)
+            self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+            self.fc1 = nn.Linear(64 * 64 * 64, 128)
+            self.fc2 = nn.Linear(128, 1)  # 输出裁剪的min值
+            self.fc3 = nn.Linear(128, 1)  # 输出裁剪的max值
+
+        def forward(self, x):
+            x = F.relu(self.conv1(x))
+            x = self.pool(x)
+            x = F.relu(self.conv2(x))
+            x = self.pool(x)
+            x = x.view(x.size(0), -1)  # Flatten
+            x = F.relu(self.fc1(x))
+            clip_min = self.fc2(x)
+            clip_max = self.fc3(x)
+            return clip_min, clip_max
+        
+    def apply_clip(image, clip_min, clip_max):
+        image = torch.clamp(image, clip_min, clip_max)
+        return image 
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    clip_model = ClipNetwork().to(device)
+    clip_model = DataParallel(clip_model)
+    
+    model = SwinUNETR(img_size=crop_size, in_channels=1, out_channels=1, feature_size=48)
+    model = model.to(device)
+    
+    pretrained_weights_path = '/scratch/mingma/HN/Radcure/Code/model/pretrained_weights/fold1_f48_ep300_4gpu_dice0_9059/model.pt'
+    pretrained_weights = torch.load(pretrained_weights_path, map_location=device)
+    state_dict = pretrained_weights['state_dict']  # 提取预训练模型的 state_dict
+    swin_weights = {k: v for k, v in state_dict.items() if ('swinViT' in k) and ('patch_embed.proj.weight' not in k)}  # 筛选 Swin Transformer 层的权重
+    model_dict = model.state_dict()  # 获取当前模型的 state_dict
+    swin_weights = {k: v for k, v in swin_weights.items()}  # 确保键匹配
+    model_dict.update(swin_weights)
+    model.load_state_dict(model_dict)
+    print(f"Loaded {len(swin_weights)} Swin Transformer layers from pre-trained weights.")
+    
+    model = DataParallel(model)
+    
+    
+    # Training Setup
+    learning_rate = 4e-4
+    weight_decay = 1e-3
+    num_epochs = 200
+    optimizer = Adam(list(clip_model.parameters()) + list(model.parameters()), lr=learning_rate, weight_decay=weight_decay)
+
+    # Losses
+    dice_focal_loss = DiceFocalLoss(include_background=True, to_onehot_y=False, sigmoid=True, softmax=False)
+    tversky_loss = TverskyLoss(include_background=True, to_onehot_y=False, sigmoid=True, alpha=0.5, beta=0.5)
+
+    def composite_loss(y_pred, y_true, clip_min, clip_max):
+        l_dfc = dice_focal_loss(y_pred, y_true)
+        l_tvr = tversky_loss(y_pred, y_true)
+        clip_loss = torch.mean((clip_min - clip_max) ** 2)
+        
+        return l_dfc + l_tvr + clip_loss
+
+    # Metrics
+    dice_metric = DiceMetric(include_background=True, reduction="mean_batch", get_not_nans=True)
+    iou_metric = MeanIoU(include_background=True, reduction="mean", get_not_nans=True)
+    hd95_metric = HausdorffDistanceMetric(include_background=True, percentile=95, reduction="mean", get_not_nans=True)
+
+    # CSV File Setup
+    out_base_dir = '/scratch/mingma/HN/Radcure/Code/model/swin_unetr/v9_aug'
+    csv_path = os.path.join(out_base_dir, 'training_validation_metrics.csv')
+    if not os.path.exists(csv_path):
+        with open(csv_path, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([
+                "Epoch", "Train Loss", "Valid Loss", 
+                "Train Dice Score", "Train IoU Score", "Train HD95 Score", 
+                "Valid Dice Score", "Valid IoU Score", "Valid HD95 Score", 
+                "Test Dice Score", "Test IoU Score", "Test HD95 Score"
+            ])
+        print(f"Created new CSV file: {csv_path}")
+    else:
+        print(f"CSV file already exists, appending to: {csv_path}")
+
+    # Training Loop
+    def load_checkpoint(checkpoint_dir, model, optimizer, device):
+        checkpoint_path = os.path.join(checkpoint_dir, 'latest_checkpoint.pth')
+        if not os.path.exists(checkpoint_path):
+            print("No checkpoint found. Starting training from scratch.")
+            return 0
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        epoch = checkpoint['epoch']
+        loss = checkpoint['loss']
+        print(f"Loaded checkpoint from {checkpoint_path}: epoch {epoch+1}, loss {loss:.6f}")
+        return epoch + 1
+
+    checkpoint_dir = os.path.join(out_base_dir, 'checkpoints')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    output_dir_train = os.path.join(out_base_dir, 'outputs_imgs', 'train')
+    output_dir_test = os.path.join(out_base_dir, 'outputs_imgs', 'test')
+    os.makedirs(output_dir_train, exist_ok=True)
+    os.makedirs(output_dir_test, exist_ok=True)
+    start_epoch = load_checkpoint(checkpoint_dir, model, optimizer, device)
+    best_val_dice_score = 0.5
+
+    for epoch in range(start_epoch, num_epochs):
+        # logging.info(f"Starting epoch {epoch + 1}")
+        model.train()
+        clip_model.train()
+        train_epoch_loss = 0
+        train_dice_scores, train_iou_scores, train_hd95_scores = [], [], []
+        
+        for ori_inputs, inputs, labels in tqdm(train_loader, desc=f"Training Epoch {epoch + 1}/{num_epochs}", miniters=1, ncols=80, leave=True):
+            ori_inputs, inputs, labels = ori_inputs.to(device).float(), inputs.to(device).float(), labels.to(device).float()
+            clip_min_pred, clip_max_pred = clip_model(ori_inputs)
+            clipped_images = apply_clip(inputs, clip_min_pred, clip_max_pred)
+            outputs = model(clipped_images)
+            loss = composite_loss(outputs, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            train_epoch_loss += loss.item()
+            threshold = 0.5
+            outputs_binary = (torch.sigmoid(outputs) > threshold).float()
+            dice_metric(y_pred=outputs_binary, y=labels)
+            train_dice_scores.append(dice_metric.aggregate()[0].item())
+            iou_metric(y_pred=outputs_binary, y=labels)
+            train_iou_scores.append(iou_metric.aggregate()[0].item())
+            hd95_metric(y_pred=outputs_binary, y=labels)
+            train_hd95_scores.append(hd95_metric.aggregate()[0].item())
+
+        # Reset metrics after aggregation
+        dice_metric.reset()
+        iou_metric.reset()
+        hd95_metric.reset()
+
+        # Save training images
+        slice_indices = [24, 28, 32, 36, 40]
+        fig, axes = plt.subplots(3, len(slice_indices), figsize=(20, 10))
+        for i, slice_index in enumerate(slice_indices):
+            slice_input = inputs[0, 0, slice_index - 1].detach().cpu()
+            slice_output = outputs_binary[0, 0, slice_index - 1].detach().cpu()
+            slice_labels = labels[0, 0, slice_index - 1].detach().cpu()                    
+            axes[0, i].imshow(slice_input.numpy(), cmap='gray')
+            axes[0, i].set_title(f"Input - Slice {slice_index}")
+            axes[0, i].axis('off')                    
+            axes[1, i].imshow(slice_output.numpy(), cmap='gray')
+            axes[1, i].set_title(f"Outputs - Slice {slice_index}")
+            axes[1, i].axis('off')                    
+            axes[2, i].imshow(slice_labels.numpy(), cmap='gray')
+            axes[2, i].set_title(f"Labels - Slice {slice_index}")
+            axes[2, i].axis('off')                    
+        file_path = os.path.join(output_dir_train, f"epoch{epoch+1}.png")
+        plt.tight_layout()
+        plt.savefig(file_path)
+        plt.close(fig)
+
+        avg_train_loss = train_epoch_loss / len(train_loader)
+        avg_train_dice_score = sum(train_dice_scores) / len(train_dice_scores)
+        avg_train_iou_score = sum(train_iou_scores) / len(train_iou_scores)
+        avg_train_hd95_score = sum(train_hd95_scores) / len(train_hd95_scores)
+        print(f"Epoch {epoch + 1}/{num_epochs}, Training Loss: {avg_train_loss:.6f}, Dice Score: {avg_train_dice_score:.6f}, IoU Score: {avg_train_iou_score:.6f}, HD95 Score: {avg_train_hd95_score:.6f}")
+
+        # Save checkpoint
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': train_epoch_loss / len(train_loader),
+        }
+        checkpoint_path = os.path.join(checkpoint_dir, 'latest_checkpoint.pth')
+        torch.save(checkpoint, checkpoint_path)
+        # print(f"Checkpoint saved: {checkpoint_path}")
+
+        # Validation Phase
+        model.eval()
+        with torch.no_grad():
+            val_epoch_loss = 0
+            val_dice_scores, val_iou_scores, val_hd95_scores = [], [], []
+            for val_data in tqdm(val_loader, desc=f"Validation Epoch {epoch + 1}/{num_epochs}", miniters=1, ncols=80, leave=True):
+                val_inputs, val_labels = val_data["image"].to(device), val_data["label"].to(device)
+                val_labels = val_labels.unsqueeze(1)
+                val_outputs = model(val_inputs)
+                val_loss = composite_loss(val_outputs, val_labels)
+                val_epoch_loss += val_loss.item()
+                val_outputs_binary = (torch.sigmoid(val_outputs) > threshold).float()
+                dice_metric(y_pred=val_outputs_binary, y=val_labels)
+                val_dice_scores.append(dice_metric.aggregate()[0].item())
+                iou_metric(y_pred=val_outputs_binary, y=val_labels)
+                val_iou_scores.append(iou_metric.aggregate()[0].item())
+                hd95_metric(y_pred=val_outputs_binary, y=val_labels)
+                val_hd95_scores.append(hd95_metric.aggregate()[0].item())
+
+            # Reset metrics after aggregation
+            dice_metric.reset()
+            iou_metric.reset()
+            hd95_metric.reset()
+
+            avg_val_loss = val_epoch_loss / len(val_loader)
+            avg_val_dice_score = sum(val_dice_scores) / len(val_dice_scores)
+            avg_val_iou_score = sum(val_iou_scores) / len(val_iou_scores)
+            avg_val_hd95_score = sum(val_hd95_scores) / len(val_hd95_scores)
+            print(f"Validation - Loss: {avg_val_loss:.6f}, Dice Score: {avg_val_dice_score:.4f}, IoU Score: {avg_val_iou_score:.4f}, HD95 Score: {avg_val_hd95_score:.4f}")
+
+            # Save best model
+            if avg_val_dice_score > best_val_dice_score:
+                best_val_dice_score = avg_val_dice_score
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': avg_val_loss,
+                }, os.path.join(checkpoint_dir, 'best_model.pth'))
+                print(f"Best model saved at epoch {epoch+1} with validation Dice score: {best_val_dice_score:.4f}")
+
+        # Test Phase
+        with torch.no_grad():
+            test_dice_scores, test_iou_scores, test_hd95_scores = [], [], []
+            for test_data in tqdm(test_loader, desc=f"Test Epoch {epoch + 1}/{num_epochs}", miniters=1, ncols=80, leave=True):
+                test_inputs, test_labels = test_data["image"].to(device), test_data["label"].to(device)
+                test_labels = test_labels.unsqueeze(1)
+                test_outputs = model(test_inputs)
+                test_outputs_binary = (torch.sigmoid(test_outputs) > threshold).float()
+                dice_metric(y_pred=test_outputs_binary, y=test_labels)
+                test_dice_scores.append(dice_metric.aggregate()[0].item())
+                iou_metric(y_pred=test_outputs_binary, y=test_labels)
+                test_iou_scores.append(iou_metric.aggregate()[0].item())
+                hd95_metric(y_pred=test_outputs_binary, y=test_labels)
+                test_hd95_scores.append(hd95_metric.aggregate()[0].item())
+
+            # Reset metrics after aggregation
+            dice_metric.reset()
+            iou_metric.reset()
+            hd95_metric.reset()
+
+            # Save test images
+            slice_indices = [24, 28, 32, 36, 40]
+            fig, axes = plt.subplots(3, len(slice_indices), figsize=(20, 10))
+            for i, slice_index in enumerate(slice_indices):
+                slice_input = test_inputs[0, 0, slice_index - 1].detach().cpu()
+                slice_output = test_outputs_binary[0, 0, slice_index - 1].detach().cpu()
+                slice_labels = test_labels[0, 0, slice_index - 1].detach().cpu()                    
+                axes[0, i].imshow(slice_input.numpy(), cmap='gray')
+                axes[0, i].set_title(f"Input - Slice {slice_index}")
+                axes[0, i].axis('off')                    
+                axes[1, i].imshow(slice_output.numpy(), cmap='gray')
+                axes[1, i].set_title(f"Outputs - Slice {slice_index}")
+                axes[1, i].axis('off')                    
+                axes[2, i].imshow(slice_labels.numpy(), cmap='gray')
+                axes[2, i].set_title(f"Labels - Slice {slice_index}")
+                axes[2, i].axis('off')                    
+            img_path = os.path.join(output_dir_test, f"epoch_{epoch+1}.png")
+            plt.tight_layout()
+            plt.savefig(img_path)
+            plt.close(fig)
+
+            avg_test_dice_score = sum(test_dice_scores) / len(test_dice_scores)
+            avg_test_iou_score = sum(test_iou_scores) / len(test_iou_scores)
+            avg_test_hd95_score = sum(test_hd95_scores) / len(test_hd95_scores)
+            print(f"Test - Dice Score: {avg_test_dice_score:.4f}, IoU Score: {avg_test_iou_score:.4f}, HD95 Score: {avg_test_hd95_score:.4f}")
+
+
+            # Save metrics to CSV file
+            with open(csv_path, mode='a', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow([epoch + 1, avg_train_loss, avg_val_loss, avg_train_dice_score, avg_train_iou_score, avg_train_hd95_score, avg_val_dice_score, avg_val_iou_score, avg_val_hd95_score, avg_test_dice_score, avg_test_iou_score, avg_test_hd95_score])
+        
+        # logging.info(f"Completed epoch {epoch + 1}")
+
+    # Save final checkpoint after training
+    checkpoint = {
+        'epoch': num_epochs,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': avg_train_loss,
+    }
+    torch.save(checkpoint, os.path.join(checkpoint_dir, f'checkpoint_final.pth'))
+               
+
+if __name__ == "__main__":
+    # logging.info("Program started")
+    main()
+    # logging.info("Program completed")
+    input("按 Enter 键退出...")
